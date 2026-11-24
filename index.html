@@ -1,0 +1,467 @@
+<meta charset="utf-8">
+<title>PCD FPS Editor</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0d10; color: #e8eef2;
+               font: 13px/1.5 system-ui, sans-serif; }
+  #c { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+  #hud { position: fixed; top: 10px; right: 10px; padding: 10px 12px; max-width: 330px;
+         background: rgba(14,18,22,.82); border: 1px solid #2a333c; border-radius: 8px;
+         pointer-events: none; white-space: pre-wrap; }
+  #hud b { color: #6cc6ff; }
+  #hud .k { color: #ffd479; }
+  #stat { margin-top: 8px; color: #9fb0bd; }
+  #gizmo { position: fixed; top: 10px; left: 10px; width: 120px; height: 120px;
+           cursor: pointer; }
+  #gizmoLabel { position: fixed; top: 132px; left: 10px; width: 120px; text-align: center;
+                color: #9fb0bd; font-size: 11px; pointer-events: none; }
+  #banner { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
+            padding: 14px 20px; background: rgba(14,18,22,.9); border: 1px solid #2a333c;
+            border-radius: 10px; text-align: center; }
+  #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+           padding: 8px 14px; background: rgba(20,26,32,.92); border: 1px solid #2a333c;
+           border-radius: 8px; opacity: 0; transition: opacity .25s; }
+</style>
+
+<canvas id="c"></canvas>
+<canvas id="gizmo" width="120" height="120" title="축 클릭 → 그 방향 뷰"></canvas>
+<div id="gizmoLabel">축 클릭=뷰 스냅</div>
+<div id="hud">
+<b>PCD FPS Editor</b>
+<span class="k">마우스</span> 구(brush) 이동 · <span class="k">좌클릭 드래그</span> 회전(yaw+pitch) · <span class="k">우클릭 드래그</span> 좌우 회전(yaw)
+<span class="k">W A S D</span> 이동 · <span class="k">E</span> 위 · <span class="k">C</span> 아래 · <span class="k">Shift</span> 가속 · <span class="k">←→↑↓</span> 제자리 회전
+<span class="k">Space 홀드</span> 구 안의 점 지우기 · <span class="k">휠</span> brush 크기
+<span class="k">; '</span> brush 거리 · <span class="k">- =</span> 점 크기
+<span class="k">Ctrl+Z</span>/<span class="k">Z</span> 되돌리기 · <span class="k">P</span> 저장(이름지정) · <span class="k">G</span> brush토글
+좌상단 <span class="k">XYZ</span> 축 클릭 = 그 방향 뷰
+<div id="stat">로딩…</div>
+</div>
+<div id="banner">PCD 로딩 중…</div>
+<div id="toast"></div>
+
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+const qs = new URLSearchParams(location.search);
+const FILE = qs.get('file') || 'cloud.pcd';
+const NAME = qs.get('name') || 'cloud';
+
+const stat = document.getElementById('stat');
+const banner = document.getElementById('banner');
+const toastEl = document.getElementById('toast');
+let toastT = 0;
+function toast(msg) {
+  toastEl.textContent = msg; toastEl.style.opacity = 1;
+  clearTimeout(toastT); toastT = setTimeout(() => toastEl.style.opacity = 0, 1600);
+}
+
+// ---------- renderer / scene ----------
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0d10);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 5000);
+camera.up.set(0, 0, 1);   // 포인트클라우드가 Z-up(높이=z) 이므로 월드 up = +Z
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// brush visual
+let brushR = 1.5, brushDist = 4.0;
+const brushMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(1, 20, 14),
+  new THREE.MeshBasicMaterial({ color: 0xff5b5b, wireframe: true, transparent: true, opacity: 0.55 }));
+scene.add(brushMesh);
+
+// 하이라이트 레이어 — brush 안에 든(=지워질) 점을 노랗게 크게 표시
+const MAXHL = 80000;
+const hlPos = new Float32Array(MAXHL * 3);
+const hlGeom = new THREE.BufferGeometry();
+hlGeom.setAttribute('position', new THREE.BufferAttribute(hlPos, 3));
+hlGeom.setDrawRange(0, 0);
+const hlPoints = new THREE.Points(hlGeom,
+  new THREE.PointsMaterial({ color: 0xffe14a, size: 0.12, sizeAttenuation: true, depthTest: false, transparent: true }));
+hlPoints.frustumCulled = false;
+scene.add(hlPoints);
+
+// ---------- PCD ascii parse (FIELDS x y z intensity, DATA ascii) ----------
+function parsePCD(text) {
+  const headerEnd = text.indexOf('DATA ascii');
+  if (headerEnd < 0) throw new Error('DATA ascii 헤더 못찾음 (ascii PCD만 지원)');
+  const header = text.slice(0, headerEnd);
+  const mPts = header.match(/POINTS\s+(\d+)/);
+  const fields = (header.match(/FIELDS\s+(.+)/)?.[1] || 'x y z intensity').trim().split(/\s+/);
+  const ix = fields.indexOf('x'), iy = fields.indexOf('y'), iz = fields.indexOf('z');
+  const ii = fields.indexOf('intensity');
+  if (ix < 0 || iy < 0 || iz < 0) throw new Error('x/y/z 필드 없음');
+  const guess = mPts ? +mPts[1] : 1_000_000;
+  const pos = new Float32Array(guess * 3);
+  const inten = new Float32Array(guess);
+  const bodyStart = text.indexOf('\n', headerEnd) + 1;
+  let p = bodyStart, n = 0;
+  const len = text.length, nf = fields.length, row = new Array(nf);
+  while (p < len) {
+    let nl = text.indexOf('\n', p); if (nl < 0) nl = len;
+    let s = p, col = 0;
+    while (s < nl && col < nf) {
+      while (s < nl && text.charCodeAt(s) === 32) s++;
+      let e = s; while (e < nl && text.charCodeAt(e) !== 32) e++;
+      if (e > s) row[col++] = +text.slice(s, e);
+      s = e;
+    }
+    if (col > iz && n * 3 + 2 < pos.length) {
+      pos[n*3] = row[ix]; pos[n*3+1] = row[iy]; pos[n*3+2] = row[iz];
+      inten[n] = ii >= 0 ? row[ii] : 0; n++;
+    }
+    p = nl + 1;
+  }
+  return { pos: pos.subarray(0, n*3), inten: inten.subarray(0, n), n };
+}
+
+const CMAP = [[0.27,0.00,0.33],[0.23,0.32,0.55],[0.13,0.57,0.55],
+             [0.37,0.79,0.38],[0.99,0.91,0.14]];
+function colormap(t, out) {
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  const f = t * (CMAP.length - 1), i = Math.floor(f), g = f - i;
+  const a = CMAP[i], b = CMAP[Math.min(i+1, CMAP.length-1)];
+  out[0]=a[0]+(b[0]-a[0])*g; out[1]=a[1]+(b[1]-a[1])*g; out[2]=a[2]+(b[2]-a[2])*g;
+}
+
+// ---------- state ----------
+let POS = null, INTEN = null, N = 0;
+let geom = null, points = null, pointSize = 0.08;
+let grid = null; const cell = 2.0;
+const undoStack = [];
+let alive = 0;
+const center = new THREE.Vector3();
+let viewDist = 20;
+
+const keyOf = (x, y, z) => Math.floor(x/cell)+'_'+Math.floor(y/cell)+'_'+Math.floor(z/cell);
+function buildGrid() {
+  grid = new Map();
+  for (let i = 0; i < N; i++) {
+    const x = POS[i*3]; if (x !== x) continue;
+    const k = keyOf(x, POS[i*3+1], POS[i*3+2]);
+    let b = grid.get(k); if (!b) grid.set(k, b = []); b.push(i);
+  }
+}
+
+async function load() {
+  const t0 = performance.now();
+  const resp = await fetch(FILE);
+  if (!resp.ok) throw new Error('fetch 실패: ' + FILE + ' (' + resp.status + ')');
+  const text = await resp.text();
+  banner.textContent = '파싱 중…';
+  await new Promise(r => setTimeout(r));
+  const parsed = parsePCD(text);
+  POS = parsed.pos; INTEN = parsed.inten; N = parsed.n; alive = N;
+
+  let zmin = Infinity, zmax = -Infinity, cx=0, cy=0, cz=0;
+  for (let i = 0; i < N; i++) {
+    const z = POS[i*3+2]; if (z<zmin)zmin=z; if (z>zmax)zmax=z;
+    cx+=POS[i*3]; cy+=POS[i*3+1]; cz+=POS[i*3+2];
+  }
+  cx/=N; cy/=N; cz/=N; center.set(cx, cy, cz);
+  const span = (zmax - zmin) || 1;
+  const col = new Float32Array(N * 3), tmp = [0,0,0];
+  for (let i = 0; i < N; i++) {
+    colormap((POS[i*3+2] - zmin) / span, tmp);
+    col[i*3]=tmp[0]; col[i*3+1]=tmp[1]; col[i*3+2]=tmp[2];
+  }
+
+  geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(POS, 3));
+  geom.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  points = new THREE.Points(geom, new THREE.PointsMaterial({ size: pointSize, vertexColors: true, sizeAttenuation: true }));
+  points.frustumCulled = false;
+  scene.add(points);
+  buildGrid();
+
+  // extent for sensible view distance
+  let ext = span;
+  // rough xy extent from a sampling
+  let xmin=Infinity,xmax=-Infinity,ymin=Infinity,ymax=-Infinity;
+  for (let i = 0; i < N; i += 17) { const x=POS[i*3],y=POS[i*3+1]; if(x<xmin)xmin=x;if(x>xmax)xmax=x;if(y<ymin)ymin=y;if(y>ymax)ymax=y; }
+  ext = Math.max(span, xmax-xmin, ymax-ymin);
+  viewDist = Math.max(15, ext * 0.6);
+  camera.position.set(cx, cy - viewDist*0.7, cz + viewDist*0.7); // 3/4 view
+  lookAtCenter();
+
+  banner.style.display = 'none';
+  toast('로드 완료 · ' + N.toLocaleString() + '점 · ' + ((performance.now()-t0)/1000).toFixed(1) + 's');
+}
+
+// ---------- camera (free cursor; middle-drag = look) ----------
+let yaw = 0, pitch = 0;
+const SENS = 0.0025;
+const PITCH_LIM = Math.PI/2 - 0.02;
+// Z-up FPS: forward = (cosθpitch·cosθyaw, cosθpitch·sinθyaw, sinθpitch), up=+Z.
+// lookAt(up=+Z) 로 세팅 → roll(기울임) 없이 순수 yaw(제자리 좌우)/pitch(상하).
+function applyLook() {
+  const cp = Math.cos(pitch);
+  const fx = cp*Math.cos(yaw), fy = cp*Math.sin(yaw), fz = Math.sin(pitch);
+  camera.lookAt(camera.position.x+fx, camera.position.y+fy, camera.position.z+fz);
+}
+function setYawPitchFromForward(fx, fy, fz) {
+  const l = Math.hypot(fx,fy,fz) || 1; fx/=l; fy/=l; fz/=l;
+  pitch = Math.max(-PITCH_LIM, Math.min(PITCH_LIM, Math.asin(Math.max(-1, Math.min(1, fz)))));
+  yaw = Math.atan2(fy, fx);
+  applyLook();
+}
+function lookAtCenter() {
+  setYawPitchFromForward(center.x-camera.position.x, center.y-camera.position.y, center.z-camera.position.z);
+}
+// snap camera to look along a world axis toward center (axis = direction from center to camera)
+function snapView(axis) {
+  if (!N) return;
+  camera.position.copy(center).addScaledVector(axis, viewDist);
+  setYawPitchFromForward(-axis.x, -axis.y, -axis.z);
+}
+
+const ndc = new THREE.Vector2(0, 0);
+canvas.addEventListener('mousemove', (e) => {
+  const r = canvas.getBoundingClientRect();
+  ndc.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+  ndc.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+  if (looking) {
+    yaw -= e.movementX * SENS; pitch -= e.movementY * SENS;
+    pitch = Math.max(-PITCH_LIM, Math.min(PITCH_LIM, pitch));
+    applyLook();
+  } else if (yawing) {    // 우클릭 드래그 = 좌우 회전(yaw only)
+    yaw -= e.movementX * SENS;
+    applyLook();
+  }
+});
+let looking = false, yawing = false;
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+canvas.addEventListener('mousedown', (e) => {
+  if (e.button === 0) looking = true;          // 좌클릭 드래그 = 시점 회전(yaw+pitch)
+  else if (e.button === 2) yawing = true;      // 우클릭 드래그 = 좌우 회전(yaw)
+});
+addEventListener('mouseup', (e) => {
+  if (e.button === 0) looking = false;
+  else if (e.button === 2) yawing = false;
+});
+// 휠 = brush 크기
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  brushR = Math.max(0.2, Math.min(20, brushR + (e.deltaY < 0 ? 0.25 : -0.25)));
+  toast('brush R=' + brushR.toFixed(2) + 'm');
+}, { passive: false });
+
+const keys = {};
+addEventListener('keydown', (e) => {
+  keys[e.code] = true;
+  if (e.code.startsWith('Arrow')) e.preventDefault();   // 방향키 = 제자리 회전(tick 처리)
+  if (e.code === 'Space') { e.preventDefault(); }   // 지우기(홀드) — tick에서 처리, 페이지 스크롤 방지
+  else if (e.code === 'KeyP') { e.preventDefault(); save(); }
+  else if (e.code === 'KeyZ') { e.preventDefault(); undo(); }   // Z and Ctrl+Z both
+  else if (e.code === 'BracketLeft')  { brushR = Math.max(0.2, brushR - 0.25); toast('brush R=' + brushR.toFixed(2) + 'm'); }
+  else if (e.code === 'BracketRight') { brushR = Math.min(20, brushR + 0.25); toast('brush R=' + brushR.toFixed(2) + 'm'); }
+  else if (e.code === 'Semicolon')    { brushDist = Math.max(1, brushDist - 0.5); toast('brush 거리=' + brushDist.toFixed(1) + 'm'); }
+  else if (e.code === 'Quote')        { brushDist = Math.min(60, brushDist + 0.5); toast('brush 거리=' + brushDist.toFixed(1) + 'm'); }
+  else if (e.code === 'Minus')  { pointSize = Math.max(0.01, pointSize - 0.01); if (points) points.material.size = pointSize; }
+  else if (e.code === 'Equal')  { pointSize = Math.min(1, pointSize + 0.01); if (points) points.material.size = pointSize; }
+  else if (e.code === 'KeyG')   { brushMesh.visible = !brushMesh.visible; }
+});
+addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+// ---------- delete / undo ----------
+const brushCenter = new THREE.Vector3();
+const _ray = new THREE.Raycaster();
+function brushWorldCenter(out) {
+  _ray.setFromCamera(ndc, camera);
+  out.copy(_ray.ray.origin).addScaledVector(_ray.ray.direction, brushDist);
+}
+function collectBrushIndices() {
+  if (!grid) return [];
+  brushWorldCenter(brushCenter);
+  const r = brushR, r2 = r*r, cx = brushCenter.x, cy = brushCenter.y, cz = brushCenter.z;
+  const i0=Math.floor((cx-r)/cell), i1=Math.floor((cx+r)/cell);
+  const j0=Math.floor((cy-r)/cell), j1=Math.floor((cy+r)/cell);
+  const k0=Math.floor((cz-r)/cell), k1=Math.floor((cz+r)/cell);
+  const hit = [];
+  for (let i=i0;i<=i1;i++) for (let j=j0;j<=j1;j++) for (let k=k0;k<=k1;k++) {
+    const b = grid.get(i+'_'+j+'_'+k); if (!b) continue;
+    for (let q=0;q<b.length;q++) {
+      const idx=b[q], o=idx*3, x=POS[o]; if (x!==x) continue;
+      const dx=x-cx, dy=POS[o+1]-cy, dz=POS[o+2]-cz;
+      if (dx*dx+dy*dy+dz*dz <= r2) hit.push(idx);
+    }
+  }
+  return hit;
+}
+function deleteIndices(hit) {
+  if (!hit.length) return 0;
+  const idxArr = Int32Array.from(hit), old = new Float32Array(idxArr.length*3);
+  for (let m=0;m<idxArr.length;m++) {
+    const o=idxArr[m]*3;
+    old[m*3]=POS[o]; old[m*3+1]=POS[o+1]; old[m*3+2]=POS[o+2];
+    POS[o]=NaN; POS[o+1]=NaN; POS[o+2]=NaN;
+  }
+  undoStack.push({ idx: idxArr, old }); if (undoStack.length > 300) undoStack.shift();
+  alive -= idxArr.length;
+  geom.attributes.position.needsUpdate = true;
+  return idxArr.length;
+}
+function undo() {
+  const u = undoStack.pop();
+  if (!u) { toast('되돌릴 것 없음'); return; }
+  for (let m=0;m<u.idx.length;m++) {
+    const o=u.idx[m]*3;
+    POS[o]=u.old[m*3]; POS[o+1]=u.old[m*3+1]; POS[o+2]=u.old[m*3+2];
+    const k = keyOf(POS[o], POS[o+1], POS[o+2]);
+    let b = grid.get(k); if (!b) grid.set(k, b=[]); b.push(u.idx[m]);
+  }
+  alive += u.idx.length;
+  geom.attributes.position.needsUpdate = true;
+  toast('되돌림 +' + u.idx.length.toLocaleString());
+}
+
+// ---------- save ----------
+async function save() {
+  if (!POS) return;
+  const lines = [];
+  for (let i=0;i<N;i++){ const o=i*3,x=POS[o]; if(x!==x)continue; lines.push(x+' '+POS[o+1]+' '+POS[o+2]+' '+INTEN[i]); }
+  const n = lines.length;
+  const header = '# .PCD v0.7 - Point Cloud Data file format\nVERSION 0.7\nFIELDS x y z intensity\n' +
+    'SIZE 4 4 4 4\nTYPE F F F F\nCOUNT 1 1 1 1\nWIDTH '+n+'\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS '+n+'\nDATA ascii\n';
+  const blob = new Blob([header, lines.join('\n'), '\n'], { type: 'application/octet-stream' });
+  const suggested = NAME + '-edit.pcd';
+  // File System Access API: 폴더+이름 직접 선택(원본과 다른 이름으로 저장). 원본은 안 건드림.
+  if (window.showSaveFilePicker) {
+    try {
+      const h = await showSaveFilePicker({ suggestedName: suggested,
+        types: [{ description: 'PCD', accept: { 'application/octet-stream': ['.pcd'] } }] });
+      const w = await h.createWritable(); await w.write(blob); await w.close();
+      toast('저장: ' + h.name + ' · ' + n.toLocaleString() + '점'); return;
+    } catch (e) { if (e.name === 'AbortError') { toast('저장 취소'); return; } }
+  }
+  let fname = prompt('저장 파일명 (.pcd)', suggested);
+  if (!fname) { toast('저장 취소'); return; }
+  if (!fname.endsWith('.pcd')) fname += '.pcd';
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = fname; a.click();
+  URL.revokeObjectURL(a.href);
+  toast('저장: ' + fname + ' · ' + n.toLocaleString() + '점');
+}
+
+// ---------- axis gizmo (top-left, clickable) ----------
+const gcanvas = document.getElementById('gizmo');
+const grenderer = new THREE.WebGLRenderer({ canvas: gcanvas, antialias: true, alpha: true });
+grenderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+grenderer.setSize(120, 120, false);
+const gscene = new THREE.Scene();
+const gcam = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+const AX = [
+  { v: new THREE.Vector3( 1,0,0), c: 0xff5b5b, label: 'X' },
+  { v: new THREE.Vector3(-1,0,0), c: 0x8a3b3b },
+  { v: new THREE.Vector3(0, 1,0), c: 0x5bff8a, label: 'Y' },
+  { v: new THREE.Vector3(0,-1,0), c: 0x3b8a52 },
+  { v: new THREE.Vector3(0,0, 1), c: 0x6c9cff, label: 'Z' },
+  { v: new THREE.Vector3(0,0,-1), c: 0x3b558a },
+];
+const gHandles = [];
+function labelSprite(txt) {
+  const cv = document.createElement('canvas'); cv.width = cv.height = 64;
+  const x = cv.getContext('2d'); x.fillStyle = '#fff'; x.font = 'bold 44px sans-serif';
+  x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText(txt, 32, 34);
+  const tex = new THREE.CanvasTexture(cv);
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false }));
+  sp.scale.setScalar(0.5); return sp;
+}
+for (const a of AX) {
+  const g = new THREE.Group();
+  const line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), a.v.clone().multiplyScalar(0.9)]),
+    new THREE.LineBasicMaterial({ color: a.c }));
+  g.add(line);
+  const ball = new THREE.Mesh(new THREE.SphereGeometry(0.16, 16, 12),
+    new THREE.MeshBasicMaterial({ color: a.c }));
+  ball.position.copy(a.v); ball.userData.axis = a.v; g.add(ball);
+  gHandles.push(ball);
+  if (a.label) { const sp = labelSprite(a.label); sp.position.copy(a.v).multiplyScalar(1.35); g.add(sp); }
+  gscene.add(g);
+}
+const graycaster = new THREE.Raycaster();
+gcanvas.addEventListener('mousedown', (e) => {
+  const r = gcanvas.getBoundingClientRect();
+  const m = new THREE.Vector2(((e.clientX-r.left)/r.width)*2-1, -((e.clientY-r.top)/r.height)*2+1);
+  graycaster.setFromCamera(m, gcam);
+  const hits = graycaster.intersectObjects(gHandles, false);
+  if (hits.length) { snapView(hits[0].object.userData.axis.clone()); toast('뷰: ' + axisName(hits[0].object.userData.axis)); }
+});
+function axisName(v) {
+  if (v.x>0.5)return '+X'; if (v.x<-0.5)return '-X';
+  if (v.y>0.5)return '+Y'; if (v.y<-0.5)return '-Y';
+  if (v.z>0.5)return '+Z'; return '-Z';
+}
+
+// ---------- loop ----------
+const clock = new THREE.Clock();
+let fps = 0, facc = 0, fcnt = 0;
+function tick() {
+  requestAnimationFrame(tick);
+  const dt = Math.min(clock.getDelta(), 0.1);
+
+  const step = (keys['ShiftLeft'] || keys['ShiftRight'] ? 18 : 6) * dt;
+  const fwd = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
+  const right = new THREE.Vector3(1,0,0).applyQuaternion(camera.quaternion);
+  if (keys['KeyW']) camera.position.addScaledVector(fwd, step);
+  if (keys['KeyS']) camera.position.addScaledVector(fwd, -step);
+  if (keys['KeyD']) camera.position.addScaledVector(right, step);
+  if (keys['KeyA']) camera.position.addScaledVector(right, -step);
+  if (keys['KeyE']) camera.position.z += step;   // 위
+  if (keys['KeyC']) camera.position.z -= step;   // 아래
+
+  // 방향키 = 제자리 회전 (←→ yaw, ↑↓ pitch)
+  const turn = 1.3 * dt;
+  if (keys['ArrowLeft'] || keys['ArrowRight'] || keys['ArrowUp'] || keys['ArrowDown']) {
+    if (keys['ArrowLeft'])  yaw += turn;
+    if (keys['ArrowRight']) yaw -= turn;
+    if (keys['ArrowUp'])    pitch += turn;
+    if (keys['ArrowDown'])  pitch -= turn;
+    pitch = Math.max(-PITCH_LIM, Math.min(PITCH_LIM, pitch));
+    applyLook();
+  }
+
+  brushWorldCenter(brushCenter);
+  brushMesh.position.copy(brushCenter);
+  brushMesh.scale.setScalar(brushR);
+  // brush 안의 점 = 지워질 점 → 노란 하이라이트
+  const inBrush = brushMesh.visible ? collectBrushIndices() : [];
+  let hc = 0;
+  for (let m = 0; m < inBrush.length && hc < MAXHL; m++) {
+    const o = inBrush[m]*3; hlPos[hc*3]=POS[o]; hlPos[hc*3+1]=POS[o+1]; hlPos[hc*3+2]=POS[o+2]; hc++;
+  }
+  hlGeom.setDrawRange(0, hc);
+  hlGeom.attributes.position.needsUpdate = true;
+  hlPoints.material.size = pointSize * 2.2;
+  const erasing = !!keys['Space'];
+  if (erasing && inBrush.length) deleteIndices(inBrush);
+
+  renderer.render(scene, camera);
+
+  // gizmo: orientation mirrors main camera
+  const back = new THREE.Vector3(0,0,1).applyQuaternion(camera.quaternion);
+  gcam.position.copy(back.multiplyScalar(4));
+  gcam.up.copy(new THREE.Vector3(0,1,0).applyQuaternion(camera.quaternion));
+  gcam.lookAt(0,0,0);
+  grenderer.render(gscene, gcam);
+
+  facc += dt; fcnt++;
+  if (facc > 0.3) { fps = Math.round(fcnt/facc); facc = 0; fcnt = 0; }
+  stat.textContent = (erasing ? '🔴 지우는중' : (looking ? '🔄 회전중' : (yawing ? '↔ yaw 회전' : '🖱 brush=마우스'))) +
+    '  |  남은 ' + alive.toLocaleString() + ' / ' + N.toLocaleString() +
+    '  |  ' + fps + 'fps  |  R=' + brushR.toFixed(2) + ' d=' + brushDist.toFixed(1);
+}
+
+load().catch(err => { banner.textContent = '에러: ' + err.message; console.error(err); });
+tick();
+</script>
