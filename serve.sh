@@ -1,18 +1,32 @@
 #!/usr/bin/env bash
 # PCD FPS Editor 런처.
-# 사용법: input/ 폴더에 .pcd 를 넣고 ./serve.sh [포트]  (기본 포트 = 8000)
-#   여러 개면 가장 최근에 수정된 파일을 연다. 저장은 results/ 에 떨어진다.
+# 사용법: input/ 폴더에 .pcd 를 넣고 ./serve.sh [-n 이름] [포트]  (기본 포트 = 8000)
+#   -n 이름   input/<이름>.pcd 를 연다 (생략 시 가장 최근에 수정된 파일)
+#   저장은 results/ 에 떨어진다.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-PORT="${1:-8000}"
+NAME=""
+PORT=8000
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n) NAME="${2:?-n 뒤에 이름 필요}"; shift 2 ;;
+    *)  PORT="$1"; shift ;;
+  esac
+done
 
 mkdir -p "$HERE/input" "$HERE/results"
 
-# input/ 에서 대상 PCD 선택 (여러 개면 최신 수정 파일)
-PCD="$(ls -1t "$HERE/input"/*.pcd 2>/dev/null | head -1 || true)"
-[ -n "$PCD" ] || { echo "[ERROR] input/ 에 .pcd 가 없음 — 편집할 PCD 를 $HERE/input/ 에 넣고 다시 실행"; exit 1; }
-COUNT="$(ls -1 "$HERE/input"/*.pcd | wc -l)"
-[ "$COUNT" -gt 1 ] && echo "[*] input/ 에 PCD ${COUNT}개 — 최신 파일 사용: $(basename "$PCD")"
+# input/ 에서 대상 PCD 선택
+if [ -n "$NAME" ]; then
+  NAME="${NAME%.pcd}"
+  PCD="$HERE/input/$NAME.pcd"
+  [ -f "$PCD" ] || { echo "[ERROR] input/$NAME.pcd 없음 — input/ 목록:"; ls -1 "$HERE/input"/*.pcd 2>/dev/null | xargs -rn1 basename; exit 1; }
+else
+  PCD="$(ls -1t "$HERE/input"/*.pcd 2>/dev/null | head -1 || true)"
+  [ -n "$PCD" ] || { echo "[ERROR] input/ 에 .pcd 가 없음 — 편집할 PCD 를 $HERE/input/ 에 넣고 다시 실행"; exit 1; }
+  COUNT="$(ls -1 "$HERE/input"/*.pcd | wc -l)"
+  [ "$COUNT" -gt 1 ] && echo "[*] input/ 에 PCD ${COUNT}개 — 최신 파일 사용: $(basename "$PCD") (특정 파일은 -n 이름)"
+fi
 
 # three.js 로컬 vendoring (최초 1회만 다운로드, 이후 오프라인 동작)
 mkdir -p "$HERE/vendor"

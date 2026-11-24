@@ -12,10 +12,12 @@
 2. 실행:
 
 ```bash
-./serve.sh [포트]   # 기본 포트 8000
+./serve.sh [-n 이름] [포트]   # 기본 포트 8000
+./serve.sh -n asd             # input/asd.pcd 를 연다
 ```
 
-- `input/` 에 PCD가 여러 개면 가장 최근에 수정된 파일을 연다.
+- `-n 이름` 을 주면 `input/<이름>.pcd` 를 연다 (`.pcd` 붙여도 됨, 없으면 input/ 목록 보여주고 종료).
+- `-n` 생략 시 `input/` 에서 가장 최근에 수정된 파일을 연다.
 - 실행하면 브라우저가 자동으로 열림 (xdg-open).
 - 요구사항: `python3`, 최초 실행 시 three.js 다운로드를 위한 `curl` 또는 `wget` (이후 오프라인 동작)
 
