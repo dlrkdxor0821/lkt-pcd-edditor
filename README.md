@@ -3,19 +3,26 @@
 브라우저에서 PCD 포인트클라우드를 FPS 시점으로 돌아다니며 점을 지우고 저장하는 편집기.
 
 - `index.html` — three.js 기반 PCD FPS Editor (ascii PCD, `FIELDS x y z intensity` 지원)
-- `serve.sh` — 로컬 서버 런처 (three.js 최초 1회 자동 다운로드 → `vendor/`)
+- `serve.sh` — 런처 (input/ 스캔, three.js 최초 1회 자동 다운로드 → `vendor/`)
+- `serve.py` — 정적 서빙 + 저장(POST /save → `results/`) 서버
 
 ## 실행 방법
 
+1. 편집할 `.pcd` 파일을 `input/` 폴더에 넣는다.
+2. 실행:
+
 ```bash
-./serve.sh [PCD경로] [포트]
+./serve.sh [포트]   # 기본 포트 8000
 ```
 
-- 기본 PCD: `~/leekt/seo-map/seo-002.pcd`, 기본 포트: `8000`
-- 예시: `./serve.sh ~/maps/seo-001.pcd 8000`
-- 실행하면 `http://localhost:8000/?file=cloud.pcd&name=<이름>` 이 자동으로 열림 (xdg-open)
+- `input/` 에 PCD가 여러 개면 가장 최근에 수정된 파일을 연다.
+- 실행하면 브라우저가 자동으로 열림 (xdg-open).
 - 요구사항: `python3`, 최초 실행 시 three.js 다운로드를 위한 `curl` 또는 `wget` (이후 오프라인 동작)
-- 저장(`P`)은 원본을 건드리지 않고 `<이름>-edit.pcd` 로 새 파일 저장 (File System Access API 지원 브라우저는 폴더/이름 직접 선택, 미지원 시 다운로드 폴더)
+
+## 저장
+
+- `P` 를 누르면 `results/` 폴더에 **원본과 같은 이름**으로 저장된다. 원본(`input/`)은 건드리지 않음.
+- 같은 이름이 이미 있으면 `이름 (2).pcd`, `이름 (3).pcd` 식으로 번호가 붙는다.
 
 ## 조작법
 
@@ -31,6 +38,6 @@
 | `;` `'` | brush 거리 |
 | `-` `=` | 점 크기 |
 | `Ctrl+Z` / `Z` | 되돌리기 |
-| `P` | 저장 (이름 지정) |
+| `P` | 저장 (`results/`) |
 | `G` | brush 토글 |
 | 좌상단 XYZ 축 클릭 | 해당 방향 뷰 |
